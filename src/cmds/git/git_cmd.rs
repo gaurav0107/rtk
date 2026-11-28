@@ -540,22 +540,33 @@ fn run_show(
         for arg in args {
             cmd.arg(arg);
         }
-        let result = exec_capture(&mut cmd).context("Failed to run git show")?;
+        let result =
+            crate::core::stream::exec_capture_bytes(&mut cmd).context("Failed to run git show")?;
         // Verbatim, and before the exit check: `git show --check` reports on stdout and then
-        // exits 2, so returning early on failure threw the whole report away.
-        print!("{}", result.stdout);
+        // exits 2, so returning early on failure threw the whole report away. Written as git's
+        // bytes: `git show --stat <tag>` of a tag that names a blob prints the blob, which need
+        // not be UTF-8 (#5330).
+        {
+            use std::io::Write;
+            std::io::stdout()
+                .lock()
+                .write_all(&result.stdout)
+                .context("Failed to write git show output")?;
+        }
         if !result.success() {
-            if !result.stderr.trim().is_empty() {
-                eprintln!("{}", result.stderr.trim());
+            let stderr = crate::core::utils::decode_process_output(&result.stderr);
+            if !stderr.trim().is_empty() {
+                eprintln!("{}", stderr.trim());
             }
             return Ok(result.exit_code);
         }
 
+        let stdout = crate::core::utils::decode_process_output(&result.stdout);
         timer.track(
             &tracked,
             &tracking::passthrough_label(&tracked),
-            &result.stdout,
-            &result.stdout,
+            &stdout,
+            &stdout,
         );
 
         return Ok(0);
@@ -683,23 +694,28 @@ fn run_show(
     for arg in args {
         raw_cmd.arg(arg);
     }
-    let raw_result = exec_capture(&mut raw_cmd).context("Failed to run git show")?;
+    // Captured as bytes: when the steps below find no commit in what git showed, these bytes
+    // are printed as they are (see `shows_no_commit`).
+    let raw_bytes =
+        crate::core::stream::exec_capture_bytes(&mut raw_cmd).context("Failed to run git show")?;
+    let raw_output = crate::core::utils::decode_process_output(&raw_bytes.stdout);
     // git's verdict on the command as the user typed it, before the steps below run it again
     // with RTK's own flags -- the stat step strips the patch-shape flags, so it succeeds where
     // git refused (`git show -pq HEAD` exits 128 raw) and the compaction looked like success.
-    if !raw_result.success() {
-        if !raw_result.stderr.trim().is_empty() {
-            eprint!("{}", raw_result.stderr);
+    if !raw_bytes.success() {
+        let stderr = crate::core::utils::decode_process_output(&raw_bytes.stderr);
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
         }
         timer.track(
             &tracked,
             &format!("rtk {tracked}"),
-            &raw_result.stdout,
-            &raw_result.stdout,
+            &raw_output,
+            &raw_output,
         );
-        return Ok(raw_result.exit_code);
+        return Ok(raw_bytes.exit_code);
     }
-    let raw_output = raw_result.stdout;
+    let rtk_label = format!("rtk {tracked}");
 
     // Step 1: one-line commit summary
     let mut summary_cmd = show_cmd(
@@ -709,12 +725,28 @@ fn run_show(
         &["--no-patch", "--pretty=format:%h %s (%ar) <%an>"],
         true,
     );
-    let summary_result = exec_capture(&mut summary_cmd).context("Failed to run git show")?;
-    if !summary_result.success() {
-        eprintln!("{}", summary_result.stderr);
-        return Ok(summary_result.exit_code);
+    let summary_bytes = crate::core::stream::exec_capture_bytes(&mut summary_cmd)
+        .context("Failed to run git show")?;
+    if !summary_bytes.success() {
+        eprintln!(
+            "{}",
+            crate::core::utils::decode_process_output(&summary_bytes.stderr)
+        );
+        return Ok(summary_bytes.exit_code);
     }
-    let mut printed = summary_result.stdout.trim().to_string();
+    // A blob or a tree ignores `--no-patch` and `--pretty`, so when the summary step printed
+    // exactly what plain `git show` did, there is no commit here to summarise.
+    if shows_no_commit(&summary_bytes.stdout, &raw_bytes.stdout) {
+        return emit_raw_bytes_passthrough(
+            &raw_bytes.stdout,
+            &tracked,
+            &rtk_label,
+            &timer,
+            raw_bytes.exit_code,
+        );
+    }
+    let summary_output = crate::core::utils::decode_process_output(&summary_bytes.stdout);
+    let mut printed = summary_output.trim().to_string();
 
     if body_is_suppressed(&tokens) {
         // `git show -s` is the commit summary and nothing else, so the stat and diff steps
@@ -755,8 +787,23 @@ fn run_show(
     // No `--patch` here: a patch is `show`'s default, and forcing it would override a user
     // `-s`/`--no-patch`, whose whole point is that there is no body to print.
     let mut diff_cmd = show_cmd(global_args, args, &tokens, &["--pretty=format:"], false);
-    let diff_result = exec_capture(&mut diff_cmd).context("Failed to run git show (diff)")?;
-    let diff_text = diff_result.stdout.trim();
+    let diff_bytes = crate::core::stream::exec_capture_bytes(&mut diff_cmd)
+        .context("Failed to run git show (diff)")?;
+    // An annotated tag prints a `Tagger:` line whose date only the default format shows, so a
+    // tag that points at a blob or a tree fails the raw comparison above. Both this step and the
+    // summary step use a format of their own, though, and the patch flags that tell them apart
+    // do nothing to a tag's target, so they print the same bytes exactly when no commit is shown.
+    if shows_no_commit(&diff_bytes.stdout, &summary_bytes.stdout) {
+        return emit_raw_bytes_passthrough(
+            &raw_bytes.stdout,
+            &tracked,
+            &rtk_label,
+            &timer,
+            raw_bytes.exit_code,
+        );
+    }
+    let diff_output = crate::core::utils::decode_process_output(&diff_bytes.stdout);
+    let diff_text = diff_output.trim();
 
     if !diff_text.is_empty() {
         if verbose > 0 {
@@ -770,9 +817,24 @@ fn run_show(
     let shown = never_worse(&raw_output, &printed);
     println!("{}", shown);
 
-    timer.track(&tracked, &format!("rtk {tracked}"), &raw_output, shown);
+    timer.track(&tracked, &rtk_label, &raw_output, shown);
 
     Ok(0)
+}
+
+/// Whether two of `run_show`'s commit-path steps printed the same bytes, which happens only
+/// when git showed no commit: a ref or tag that names a blob, or a tree (#5330). Those reach
+/// the commit path because the blob pre-filter goes by spelling, and probing every symbolic
+/// name with `git cat-file` would slow down each `git show HEAD`.
+///
+/// For a commit the steps always differ. The summary step prints `%h %s (%ar) <%an>`, the raw
+/// step a `commit <sha>` header, and the diff step only the patch. For a blob or a tree git
+/// ignores the patch and format flags that tell the steps apart.
+///
+/// Empty output is not a match. Two steps that printed nothing have nothing in common to pass
+/// through.
+fn shows_no_commit(step: &[u8], other: &[u8]) -> bool {
+    !step.is_empty() && step == other
 }
 
 /// Whether these args make git emit a word diff rather than a line diff.
@@ -5975,6 +6037,18 @@ mod tests {
             !result.contains("more changes truncated"),
             "5 files × 20 lines should not exceed max_lines=500"
         );
+    }
+
+    #[test]
+    fn shows_no_commit_needs_the_same_non_empty_bytes() {
+        assert!(shows_no_commit(b"caf\xe9 end", b"caf\xe9 end"));
+        // A commit with an empty patch: two steps that printed nothing are not a blob.
+        assert!(!shows_no_commit(b"", b""));
+        assert!(!shows_no_commit(
+            b"abc1234 c (now) <t>",
+            b"\ndiff --git a/x b/x\n"
+        ));
+        assert!(!shows_no_commit(b"caf\xe9 end", b"caf\xe9 end\n"));
     }
 
     #[test]
